@@ -21,6 +21,10 @@
 # HAB_ON_PREM_BOOTSTRAP_KEEP_ARCHIVE_FILE: Sometimes you don't want to delete the
 # archive file you just spent many minutes creating. Setting this keeps the file.
 #
+# HAB_ON_PREM_BOOTSTRAP_NO_UPLOAD: This controls whether the script will upload
+# the archive file to AWS S3 bucket.  Very handy when your company does not have 
+# access to AWS.
+# 
 # Additionally, if you're using this script to populate an existing depot, and you
 # don't have network connectivity to download a tarball from S3, you can pass the
 # path to your existing tarball as the third argument and that will be used to
@@ -31,7 +35,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: on-prem-archive.sh {create-archive | populate-depot <DEPOT_URL> [PATH_TO_EXISTING_TARBALL] | download-archive | upload-archive <PATH_TO_EXISTING_TARBALL>}"
+  echo "Usage: on-prem-archive.sh {create-archive | populate-depot <DEPOT_URL> [PATH_TO_EXISTING_TARBALL] | download-archive | upload-archive <PATH_TO_EXISTING_TARBALL>} | sync-packages <DEPOT_URL> [base-plans]"
   exit 1
 }
 
@@ -111,6 +115,24 @@ download_hart_if_missing() {
   fi
 }
 
+latest_ident() {
+  local pkg_name_=$1
+  local target_=$2
+  local latest_
+  local raw_ident_
+
+  latest_=$(curl -s -H "Accept: application/json" "$upstream_depot/v1/depot/channels/core/stable/pkgs/$pkg_name_/latest?target=$target_")
+  set +e
+  raw_ident_=$(echo "$latest_" | jq ".ident")
+  retVal=$?
+  if [ $retVal -ne 0 ]; then
+    echo "-1"
+  else
+    echo "$raw_ident_"
+  fi
+  set -e
+}
+
 populate_packages() {
   local dir_list=$1
 
@@ -130,11 +152,88 @@ populate_packages() {
 upload_archive() {
   local archive=$1
   local bs_file
-  bs_file=$(basename "$1")
-  echo "Uploading tar file to S3."
-  s3_cp "$archive" "s3://$bucket/"
-  s3_cp "s3://$bucket/$bs_file" "s3://$bucket/$marker"
-  echo "Upload to S3 finished."
+
+  if [ "${HAB_ON_PREM_BOOTSTRAP_NO_UPLOAD:-}" ]; then
+    echo "Uploading skipped."
+  else
+    echo "Uploading $archive"
+
+    bs_file=$(basename "$1")
+    echo "Uploading tar file to S3."
+    s3_cp "$archive" "s3://$bucket/"
+    s3_cp "s3://$bucket/$bs_file" "s3://$bucket/$marker"
+    echo "Upload to S3 finished."
+  fi
+}
+
+populate_dirs() {
+  core_tmp=$(mktemp -d)
+  upstream_depot="https://bldr.habitat.sh"
+  core="$core_tmp/core-plans"
+  habitat="$core_tmp/habitat"
+  bootstrap_file="on-prem-bootstrap-$(date +%Y%m%d%H%M%S).tar.gz"
+  tar_file="/tmp/$bootstrap_file"
+  tmp_dir=$(mktemp -d)
+
+  # we need to store both harts and keys because hab will try to upload public keys
+  # when it uploads harts and will panic if the key that a hart was built with doesn't
+  # exist.
+  mkdir -p "$tmp_dir/harts"
+  mkdir -p "$tmp_dir/keys"
+
+  # download keys first
+  keys=$(curl -s -H "Accept: application/json" "$upstream_depot/v1/depot/origins/core/keys" | jq ".[] | .location")
+  for k in $keys
+  do
+    key=$(tr -d '"' <<< "$k")
+    release=$(cut -d '/' -f 5 <<< "$key")
+    curl -s -H "Accept: application/json" -o "$tmp_dir/keys/$release.pub" "$upstream_depot/v1/depot$key"
+  done
+
+  git clone --depth 1 https://github.com/habitat-sh/core-plans.git "$core"
+  cd "$core"
+
+  # we want both the directory name and the file name here
+  cp_dir_list=$(find . -type f -name "plan.*" -printf "%h~%f\\n" | sort -u)
+  populate_packages "$cp_dir_list"
+
+  # let's also pull in any hab components that might have a hart file
+  git clone --depth 1 https://github.com/habitat-sh/habitat.git "$habitat"
+  cd "$habitat/components"
+
+  hb_dir_list=$(find . -type f -name "plan.*" -printf "%h~%f\\n" | sort -u)
+  populate_packages "$hb_dir_list"
+
+  pkg_total=${#packages[@]}
+  pkg_count="0"
+}
+
+read_base_plans() {
+  base_plans=()
+  cd "$core"
+  while read -r line
+  do
+    first=( $line )
+    base_plans+=(${first##*/})
+  done < base-plans.txt
+}
+
+upload_keys() {
+    echo
+    echo "Uploading keys to ${depot_url}"
+
+    cd "$tmp_dir/keys"
+    keys=$(find . -type f -name "*.pub")
+    key_total=$(echo "$keys" | wc -l)
+    key_count="0"
+
+    for key in $keys
+    do
+      key_count=$((key_count+1))
+      echo
+      echo "[$key_count/$key_total] Uploading $key"
+      hab origin key upload -u ${depot_url} --pubfile "$key"
+    done
 }
 
 bucket="${HAB_ON_PREM_BOOTSTRAP_BUCKET_NAME:-habitat-on-prem-builder-bootstrap}"
@@ -144,48 +243,14 @@ declare -a packages
 
 case "${1:-}" in
   create-archive)
-    check_tools aws git curl jq xzcat
-    check_vars AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    check_tools git curl jq xzcat
 
-    core_tmp=$(mktemp -d)
-    upstream_depot="https://bldr.habitat.sh"
-    core="$core_tmp/core-plans"
-    habitat="$core_tmp/habitat"
-    bootstrap_file="on-prem-bootstrap-$(date +%Y%m%d%H%M%S).tar.gz"
-    tar_file="/tmp/$bootstrap_file"
-    tmp_dir=$(mktemp -d)
+    if [ -z "${HAB_ON_PREM_BOOTSTRAP_NO_UPLOAD:-}" ]; then
+      check_tools aws
+      check_vars AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    fi
 
-    # we need to store both harts and keys because hab will try to upload public keys
-    # when it uploads harts and will panic if the key that a hart was built with doesn't
-    # exist.
-    mkdir -p "$tmp_dir/harts"
-    mkdir -p "$tmp_dir/keys"
-
-    # download keys first
-    keys=$(curl -s -H "Accept: application/json" "$upstream_depot/v1/depot/origins/core/keys" | jq ".[] | .location")
-    for k in $keys
-    do
-      key=$(tr -d '"' <<< "$k")
-      release=$(cut -d '/' -f 5 <<< "$key")
-      curl -s -H "Accept: application/json" -o "$tmp_dir/keys/$release.pub" "$upstream_depot/v1/depot$key"
-    done
-
-    git clone https://github.com/habitat-sh/core-plans.git "$core"
-    cd "$core"
-
-    # we want both the directory name and the file name here
-    cp_dir_list=$(find . -type f -name "plan.*" -printf "%h~%f\\n" | sort -u)
-    populate_packages "$cp_dir_list"
-
-    # let's also pull in any hab components that might have a hart file
-    git clone https://github.com/habitat-sh/habitat.git "$habitat"
-    cd "$habitat/components"
-
-    hb_dir_list=$(find . -type f -name "plan.*" -printf "%h~%f\\n" | sort -u)
-    populate_packages "$hb_dir_list"
-
-    pkg_total=${#packages[@]}
-    pkg_count="0"
+    populate_dirs
 
     for p in "${packages[@]}"
     do
@@ -195,64 +260,156 @@ case "${1:-}" in
       pkg_count=$((pkg_count+1))
 
       if [ "$plan_name" == "plan.sh" ]; then
-        target="x86_64-linux"
+        targets=("x86_64-linux" "x86_64-linux-kernel2")
       elif [ "$plan_name" == "plan.ps1" ]; then
-        target="x86_64-windows"
+        targets=("x86_64-windows")
       else
         echo "Unsupported plan: $plan_name"
         exit 1
       fi
 
-      echo
-      echo "[$pkg_count/$pkg_total] Resolving latest stable version of core/$pkg_name"
-      latest=$(curl -s -H "Accept: application/json" "$upstream_depot/v1/depot/channels/core/stable/pkgs/$pkg_name/latest?target=$target")
-      raw_ident=$(echo "$latest" | jq ".ident")
+      for target in "${targets[@]}"
+      do 
+        echo
+        echo "[$pkg_count/$pkg_total] Resolving latest stable version of core/$pkg_name for $target"
 
-      if [ "$raw_ident" = "null" ]; then
-        echo "Failed to find a latest version. Skipping."
-        continue
-      fi
+        raw_ident=$(latest_ident "$pkg_name" "$target")
 
-      slash_ident=$(jq '"\(.origin)/\(.name)/\(.version)/\(.release)"' <<< "$raw_ident" | tr -d '"')
-
-      # check to see if we have this file before fetching it again
-      local_file="$tmp_dir/harts/$(tr '/' '-' <<< "$slash_ident")-$target.hart"
-
-      if download_hart_if_missing "$local_file" "$slash_ident" "[$pkg_count/$pkg_total]" "$target"; then
-        # now extract the tdeps and download those too
-        local_tar=$(basename "$local_file" .hart).tar
-        tail -n +6 "$local_file" | unxz > "$local_tar"
-
-        if tar tf "$local_tar" --no-anchored TDEPS > /dev/null 2>&1; then
-          tdeps=$(tail -n +6 "$local_file" | xzcat | tar xfO - --no-anchored TDEPS)
-          dep_total=$(echo "$tdeps" | wc -l)
-          dep_count="0"
-
-          echo "[$pkg_count/$pkg_total] $slash_ident has the following $dep_total transitive dependencies:"
-          echo
-          echo "$tdeps"
-          echo
-          echo "Processing dependencies now."
-          echo
-
-          for dep in $tdeps
-          do
-            dep_count=$((dep_count+1))
-            file_to_check="$tmp_dir/harts/$(tr '/' '-' <<< "$dep")-$target.hart"
-            download_hart_if_missing "$file_to_check" "$dep" "[$pkg_count/$pkg_total] [$dep_count/$dep_total]" "$target" || true
-          done
-        else
-          echo "[$pkg_count/$pkg_total] $slash_ident has no TDEPS file. Skipping processing of dependencies."
+        if [ "$raw_ident" = "" ]; then
+          echo "Failed to find a latest version. Skipping."
+          continue
         fi
-      fi
+
+        if [ "$raw_ident" = "-1" ]; then
+          echo "Failed to parse the response for $pkg_name. Skipping."
+          continue
+        fi
+
+        slash_ident=$(jq '"\(.origin)/\(.name)/\(.version)/\(.release)"' <<< "$raw_ident" | tr -d '"')
+
+        # check to see if we have this file before fetching it again
+        local_file="$tmp_dir/harts/$(tr '/' '-' <<< "$slash_ident")-$target.hart"
+
+        if download_hart_if_missing "$local_file" "$slash_ident" "[$pkg_count/$pkg_total]" "$target"; then
+          # now extract the tdeps and download those too
+          local_tar=$(basename "$local_file" .hart).tar
+          tail -n +6 "$local_file" | unxz > "$local_tar"
+
+          if tar tf "$local_tar" --no-anchored TDEPS > /dev/null 2>&1; then
+            tdeps=$(tail -n +6 "$local_file" | xzcat | tar xfO - --no-anchored TDEPS)
+            dep_total=$(echo "$tdeps" | wc -l)
+            dep_count="0"
+
+            echo "[$pkg_count/$pkg_total] $slash_ident has the following $dep_total transitive dependencies:"
+            echo
+            echo "$tdeps"
+            echo
+            echo "Processing dependencies now."
+            echo
+
+            for dep in $tdeps
+            do
+              dep_count=$((dep_count+1))
+              file_to_check="$tmp_dir/harts/$(tr '/' '-' <<< "$dep")-$target.hart"
+              download_hart_if_missing "$file_to_check" "$dep" "[$pkg_count/$pkg_total] [$dep_count/$dep_total]" "$target" || true
+            done
+          else
+            echo "[$pkg_count/$pkg_total] $slash_ident has no TDEPS file. Skipping processing of dependencies."
+          fi
+        fi
+      done
     done
 
     # done downloading stuff. let's package it up.
     cd /tmp
     tar zcvf "$tar_file" -C "$tmp_dir" .
+
     upload_archive "$tar_file"
 
     ;;
+
+  sync-packages)
+    if [ -z "${2:-}" ]; then
+      usage
+    fi
+
+    depot_url=$2
+    check_tools git curl jq b2sum
+    check_vars HAB_AUTH_TOKEN
+    populate_dirs
+    read_base_plans
+    upload_keys
+
+    for p in "${packages[@]}"
+    do
+      IFS='~' read -ra parts <<< "$p"
+      pkg_name=${parts[0]}
+      plan_name=${parts[1]}
+      pkg_count=$((pkg_count+1))
+
+      if [ "${3:-}" == "base-plans" ]; then
+        if ! [[ " ${base_plans[@]} " =~ " ${pkg_name} " ]]; then
+          echo "[$pkg_count/$pkg_total] ${pkg_name} is not a base plan. Skipping."
+          continue
+        fi
+      fi
+
+      if [ "$plan_name" == "plan.sh" ]; then
+        targets=("x86_64-linux" "x86_64-linux-kernel2")
+      elif [ "$plan_name" == "plan.ps1" ]; then
+        targets=("x86_64-windows")
+      else
+        echo "Unsupported plan: $plan_name"
+        exit 1
+      fi
+
+      for target in "${targets[@]}"
+      do
+        echo
+        echo "[$pkg_count/$pkg_total] Checking upstream version of core/$pkg_name for $target"
+
+        raw_ident=$(latest_ident "$pkg_name" "$target")
+
+        if [ "$raw_ident" = "" ]; then
+          echo "[$pkg_count/$pkg_total] Failed to find a latest stable version on upstream. Skipping."
+          continue
+        fi
+
+        if [ "$raw_ident" = "-1" ]; then
+          echo "[$pkg_count/$pkg_total] Failed to parse the response for $pkg_name. Skipping."
+          continue
+        fi
+
+        slash_ident=$(jq '"\(.origin)/\(.name)/\(.version)/\(.release)"' <<< "$raw_ident" | tr -d '"')
+
+        # get the latest version in the local depot
+        echo "[$pkg_count/$pkg_total] Checking local version of core/$pkg_name for $target"
+        latest_local=$(curl -s -H "Accept: application/json" "${depot_url}/v1/depot/channels/core/stable/pkgs/$pkg_name/latest?target=$target")
+        raw_ident_local=$(echo "$latest_local" | jq ".ident")
+        if [ "$raw_ident_local" != "" ]; then
+          slash_ident_local=$(jq '"\(.origin)/\(.name)/\(.version)/\(.release)"' <<< "$raw_ident_local" | tr -d '"')
+          release=$(echo ${raw_ident} | jq -r '.release') 
+          release_local=$(echo ${raw_ident_local} | jq -r '.release')
+
+          if (( "$release" <= "$release_local" )); then
+            echo "[$pkg_count/$pkg_total] Upstream has an older or equal release timestamp. Skipping."
+            continue
+          fi
+        fi
+
+        # check to see if we have this file before fetching it again
+        local_file="$tmp_dir/harts/$(tr '/' '-' <<< "$slash_ident")-$target.hart"
+
+        if download_hart_if_missing "$local_file" "$slash_ident" "[$pkg_count/$pkg_total]" "$target"; then
+          echo "[$pkg_count/$pkg_total] Uploading ${slash_ident} to local depot"
+          checksum=$(b2sum -s=32 ${local_file} | cut -d ' ' -f 4-)
+          curl -so /dev/null -H "Accept: application/json" -H "Content-Type: application/json" -H "Authorization: Bearer $HAB_AUTH_TOKEN" --data-binary "@$local_file" ${depot_url}/v1/depot/pkgs/$slash_ident\?checksum=$checksum
+          hab pkg promote --url ${depot_url} ${slash_ident} stable || true
+        fi
+      done
+    done
+    ;;
+
   populate-depot)
     if [ -z "${2:-}" ]; then
       usage
